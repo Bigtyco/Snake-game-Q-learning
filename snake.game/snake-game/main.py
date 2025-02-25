@@ -1,0 +1,357 @@
+import argparse
+from argparse import Namespace, ArgumentParser
+import tkinter as tk
+from tkinter import messagebox as msgbox
+
+import pygame
+from pygame import Surface
+
+from snake import GameWorld, GameOutcome, SnakeVision
+from base import SystemState, AI_Base
+from player import Player
+from q_learning import AI_RLQ
+
+
+class MainApp:
+  def __init__(self, args: Namespace, algo: AI_Base):
+
+    self._algo = algo
+
+    self._speed: int = args.speed
+    self._high_score: int = 0
+    self._round: int = 0
+    self._pause_mode: bool = not args.nopause  # allowing pause?
+    self._gui_mode: bool = not args.nodisplay  # allowing GUI?
+    self._snake_game = GameWorld(15, 20)
+    self._surface: Surface  # hold a surface for drawing
+
+    # fps elements
+    self._game_frame: int = 0
+    self._game_fps: float = 0
+    self._game_ticks: float = 0
+    self._game_default_fps: int = 120
+
+    # tk elements
+    self._tk_root = tk.Tk()
+    self._text: tk.Text
+
+    # main loop control elements
+    self._running: bool = True
+    self._user_quitting: bool = False
+    self._clock = pygame.time.Clock()
+
+    self._current_steps = 0
+
+  def tk_callback_quit(self):
+    self._user_quitting = True
+
+  def on_init(self):
+    # initialize pygame engine
+    pygame.init()
+    pygame.display.set_caption("Snake!")
+    pygame.time.set_timer(pygame.USEREVENT, self._speed, True)
+
+    # GUI display option
+    if self._gui_mode:
+      # create a surface (ie canvas) for the game to do drawing
+      app_scr_width, app_scr_height = self._snake_game.get_screen_size()
+      self._surface = pygame.display.set_mode((app_scr_width, app_scr_height))
+
+      # hook a text widget to the root
+      self._text = tk.Text(self._tk_root, height=18, width=50)
+      self._text.configure(font=('Consolas', 16))
+      self._text.configure(state='normal')
+      self._text.pack()
+
+      # hook the root to a tk frame for debugging
+      self._tk_root.protocol("WM_DELETE_WINDOW", self.tk_callback_quit)
+      self._tk_root.title("Show state")
+      # self._tk_root.overrideredirect(True)  # 隐藏标题栏
+      self._tk_root.geometry("200x300")
+      tk.Frame(self._tk_root, width=250, height=100).pack()
+    else:
+      print("AI engine = " + self._algo.get_name())
+
+    # always start with pausing in GUI mode
+    if self._gui_mode:
+      self._snake_game.set_pause(True)
+    else:
+      self._snake_game.set_pause(False)
+
+  def on_event(self, event):
+    if event.type == pygame.QUIT:
+      self.tk_callback_quit()  # trigger tk QUIT event
+    elif event.type == pygame.USEREVENT:
+      # timer event, process AI movement...
+      if not self._snake_game.get_pause_status():  # do only if not pause
+        self.make_a_move()  # ask AI to make a move
+        outcome = self._snake_game.snake_take_step()
+
+        # 新增：步数计数器
+        self._current_steps += 1
+
+        self.on_paint()    # show the outcome on the screen
+        self.report_outcome_to_AI(outcome)
+
+        if outcome == GameOutcome.CRASHED_TO_WALL or \
+           outcome == GameOutcome.CRASHED_TO_BODY:
+          score = self._snake_game.get_score()
+          if score > self._high_score:
+            self._high_score = score
+
+          # 保存当前episode信息
+          current_episode = self._round
+          self._round += 1
+          print("round, %d, score, %d" % (self._round, score))
+
+          # 触发episode结束回调（关键新增）
+          if hasattr(self._algo, 'callback_episode_end') and \
+             getattr(self._algo, 'training_mode', False):
+            self._algo.callback_episode_end(
+                episode=current_episode,
+                steps=self._current_steps,
+                outcome=outcome
+            )
+
+          # 重置步数计数器
+          self._current_steps = 0
+
+          if self._pause_mode and self._gui_mode:
+            if msgbox.askyesno(
+                "Your Snake Crashed",
+                    "Game Over\nDo you want to play again?"):
+              self._snake_game.restart()
+              self._snake_game.set_pause(True)
+            else:
+              self._running = False
+          else:
+            self._snake_game.restart()  # always continue for no display
+            self._snake_game.set_pause(False)  # and don't pause
+        elif outcome == GameOutcome.REACHED_FOOD:
+          pass  # Food eaten, we can do something here
+          # but for now, we do nothing
+      # keep the timer running
+      pygame.time.set_timer(pygame.USEREVENT, self._speed, True)
+    elif event.type == pygame.KEYDOWN or event.type == pygame.KEYUP:
+      self.on_key_event(event)
+
+  def on_key_event(self, event):
+    if not self._gui_mode:
+      return  # skip input event if no GUI
+
+    # process pause key
+    if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
+      self._snake_game.toggle_pause()
+
+    # process other keys if keyboard is allowed
+    if self._algo.is_keyboard_allowed():
+      if event.type == pygame.KEYDOWN:
+        dir_x, dir_y = self._snake_game.get_direction()
+        if event.key == pygame.K_UP and dir_y != 1:
+          self._snake_game.snake_change_dir(0, -1)
+        elif event.key == pygame.K_DOWN and dir_y != -1:
+          self._snake_game.snake_change_dir(0, 1)
+        elif event.key == pygame.K_LEFT and dir_x != 1:
+          self._snake_game.snake_change_dir(-1, 0)
+        elif event.key == pygame.K_RIGHT and dir_x != -1:
+          self._snake_game.snake_change_dir(1, 0)
+      elif event.type == pygame.KEYUP:
+        if event.key in [pygame.K_UP, pygame.K_DOWN,
+                         pygame.K_LEFT, pygame.K_RIGHT]:
+          pass  # do nothing for key_up
+
+  def _get_state(self) -> SystemState:
+    # fill the input system state accordingly
+    state = SystemState()
+    snake_x, snake_y = self._snake_game.get_snake_loc()
+    food_x, food_y = self._snake_game.get_food_loc()
+
+    # 1. moving direction
+    state.dir_x, state.dir_y = self._snake_game.get_direction()
+
+    # 2. food direction
+    if food_x > snake_x:
+      state.food_east = True
+    elif food_x < snake_x:
+      state.food_west = True
+    if food_y > snake_y:
+      state.food_south = True
+    elif food_y < snake_y:
+      state.food_north = True
+
+    # 3. vision around the snake (one ring vision)
+    def macro_set(x, y):  # macro-like function
+      obj = self._snake_game.get_object_at(x, y)
+      return 0 if obj == SnakeVision.SPACE else \
+          +1 if obj == SnakeVision.FOOD else \
+          -1
+    state.obj_north = macro_set(snake_x, snake_y - 1)
+    state.obj_south = macro_set(snake_x, snake_y + 1)
+    state.obj_east = macro_set(snake_x + 1, snake_y)
+    state.obj_west = macro_set(snake_x - 1, snake_y)
+    state.obj_north_east = macro_set(snake_x + 1, snake_y - 1)
+    state.obj_north_west = macro_set(snake_x - 1, snake_y - 1)
+    state.obj_south_east = macro_set(snake_x + 1, snake_y + 1)
+    state.obj_south_west = macro_set(snake_x - 1, snake_y + 1)
+
+    return state
+
+  def make_a_move(self):
+    # run the algo based on the system state
+    x, y = self._algo.callback_take_action(self._get_state())
+    self._snake_game.snake_change_dir(x, y)
+
+  def report_outcome_to_AI(self, outcome: GameOutcome):
+    self._algo.callback_action_outcome(self._get_state(), outcome)
+
+  def on_paint(self):
+    if not self._gui_mode:
+      return  # skip if display is OFF
+
+    # get the game to do the drawing first
+    self._snake_game.do_paint(self._surface, self._high_score)
+    pygame.display.update()
+
+    # calculate fps
+    self._clock.tick(self._game_default_fps)  # fps setting
+    self._game_frame += 1
+    if self._game_frame % 10 == 0:
+      t = pygame.time.get_ticks()
+      self._game_fps = (float(10) * 1000.0) / (t - self._game_ticks)
+      self._game_ticks = t
+      self._game_frame = 0
+
+    # print debugging info
+    self._text.delete('1.0', tk.END)
+    self._text.insert('1.0', "\n" * 15)
+    self._text.insert('1.0', "%5.1f FPS" % self._game_fps)
+    self._text.insert('3.0', "        ")
+    self._text.insert('4.0', "   -----")
+    self._text.insert('5.0', "   |   |")
+    self._text.insert('6.0', "   |   |   ")
+    self._text.insert('7.0', "   |   |")
+    self._text.insert('8.0', "   -----")
+    self._text.insert('9.0', "        ")
+    self._text.insert(
+        '12.0',
+        "state=" +
+        self._algo.state_str(
+            self._get_state()))
+    self._text.insert('14.0', self._algo.get_name())
+
+    # get & print snake's vision
+    objlist = {SnakeVision.WALL: "W",
+               SnakeVision.FOOD: "o",
+               SnakeVision.BODY: "S",
+               SnakeVision.HEAD: "H",
+               SnakeVision.SPACE: " ",
+               SnakeVision.OUTOFSCOPE: " "}
+    snake_x, snake_y = self._snake_game.get_snake_loc()
+    for x in range(-1, 2):
+      for y in range(-1, 2):
+        obj = objlist[self._snake_game.get_object_at(snake_x + x, snake_y + y)]
+        self._text.delete(str(y + 6) + "." + str(x + 5))
+        self._text.insert(str(y + 6) + "." + str(x + 5), obj)
+
+    # get & print where the food is
+    food_x, food_y = self._snake_game.get_food_loc()
+    if food_x > snake_x:
+      self._text.delete("6.10")
+      self._text.insert("6.10", ">")
+    elif food_x < snake_x:
+      self._text.delete("6.2")
+      self._text.insert("6.2", "<")
+    if food_y > snake_y:
+      self._text.delete("9.5")
+      self._text.insert("9.5", "v")
+    elif food_y < snake_y:
+      self._text.delete("3.5")
+      self._text.insert("3.5", "^")
+
+    # print snake's moving direction
+    x, y = self._snake_game.get_direction()
+    if x == +1:
+      self._text.insert("10.0", "Moving RIGHT")
+    elif x == -1:
+      self._text.insert("10.0", "Moving LEFT")
+    elif y == +1:
+      self._text.insert("10.0", "Moving DOWN")
+    elif y == -1:
+      self._text.insert("10.0", "Moving UP")
+
+    # update tk widget
+    self._tk_root.update()
+
+  def on_exit(self):
+    pygame.quit()
+
+  def run(self):
+    self.on_init()
+
+    # this is the main loop
+    while self._running:
+      try:
+        for event in pygame.event.get():
+          self.on_event(event)  # process timer/key/mouse events if any
+        self.on_paint()          # paint the game surface
+        if self._user_quitting:  # process quitting request (in GUI mode)
+          if self._gui_mode \
+              and msgbox.askyesno("Quit",
+                                  "Do you want to exit the application?"):
+            self._running = False
+          else:
+            self._user_quitting = False
+      except KeyboardInterrupt:  # process [^C], mainly for non-GUI mode
+        print(" exiting...")
+        self._running = False
+    self._algo.callback_terminating()
+    self.on_exit()
+
+
+if __name__ == "__main__":
+  parser: ArgumentParser = argparse.ArgumentParser()
+  parser.add_argument(
+      "--nodisplay",
+      help="Run in no GUI mode",
+      action="store_true")
+  parser.add_argument(
+      "--nopause",
+      help="Run without pausing",
+      action="store_true")
+  parser.add_argument("--speed", type=int, default=300)
+  args: Namespace = parser.parse_args()
+
+  print("Let's play Snake. Press [^C] to quit")
+
+  args.nopause = True  # <-- hardcoding no pausing mode
+  args.speed = 40     # <-- hardcoding the speed
+
+  # algo = Player()      # do nothing, let human player control
+  # algo = AI_RLQ()         # Q-learning - training mode
+  algo = AI_RLQ(False)    # Q-learning - testing mode, no exploration
+
+  # for human/algo setting adjustment
+  if "Human" in algo.get_name():
+    if args.nodisplay:
+      print("- this is Human Player version, 'nodisplay' is ignored")
+      args.nodisplay = False
+    if args.speed < 300:
+      print("- this is Human Player version, slowing speed to 300 ms")
+      args.speed = 300
+    if args.nopause:
+      print("- this is Human Player version, 'nopause' is ignored")
+      args.nopause = False
+  else:
+    if args.nodisplay:
+      print("- 'nodisplay' is set, setting 'speed' to 1 ms (i.e. min delay)")
+      args.speed = 1
+    if args.nodisplay and not args.nopause:
+      print("- 'nodisplay' is set, 'nopause' to automatically enforced")
+      args.nopause = True
+  print("- game speed set to %d ms" % args.speed)
+  print("- game will%spause between rounds" %
+        (" not "if args.nopause else " "))
+  print("")
+
+  main_app = MainApp(args, algo)
+  main_app.run()
